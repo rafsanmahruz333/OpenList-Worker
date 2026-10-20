@@ -21,27 +21,27 @@ export class CryptCipher {
     this.dataKey = dataKey
   }
 
-static async create(password: string, salt: string): Promise<CryptCipher> {
-  if (!password) {
-    throw new Error("[Crypt] password cannot be empty")
+  static async create(password: string, salt: string): Promise<CryptCipher> {
+    if (!password) {
+      throw new Error("[Crypt] password cannot be empty")
+    }
+
+    const dk = scryptSync(password, salt || "", 64, {
+      N: 16384,
+      r: 8,
+      p: 1,
+    })
+
+    const dataKey = await crypto.subtle.importKey(
+      "raw",
+      new Uint8Array(dk.subarray(0, 32)),
+      { name: "AES-CTR" },
+      false,
+      ["encrypt", "decrypt"],
+    )
+
+    return new CryptCipher(dataKey)
   }
-
-  const dk = scryptSync(password, salt || "", 64, {
-    N: 16384,
-    r: 8,
-    p: 1,
-  })
-
-  const dataKey = await crypto.subtle.importKey(
-    "raw",
-    new Uint8Array(dk.subarray(0, 32)),
-    { name: "AES-CTR" },
-    false,
-    ["encrypt", "decrypt"],
-  )
-
-  return new CryptCipher(dataKey)
-}
 
   encryptedSize(plainSize: number): number {
     return plainSize + FILE_HEADER_SIZE
