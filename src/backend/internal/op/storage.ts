@@ -82,6 +82,7 @@ import { OnedriveSharelinkDriver } from "../../drivers/onedrive_sharelink/driver
 import { PikPakShareDriver } from "../../drivers/pikpak_share/driver"
 import { SMBDriver } from "../../drivers/smb/driver"
 import { CryptDriver } from "../../drivers/crypt/driver"
+import { CryptV2Driver } from "../../drivers/crypt/driver-v2"
 import { VirtualDriver } from "../../drivers/virtual/driver"
 import { AListV3Driver } from "../../drivers/alist_v3/driver"
 import { UrlTreeDriver } from "../../drivers/url_tree/driver"
@@ -1105,6 +1106,10 @@ async function createDriver(
   } else if (normDriver === "crypt") {
     const addition = parseAddition(storageConfig)
     driver = new CryptDriver(addition)
+    await driver.init?.()
+  } else if (normDriver === "cryptv2") {
+    const addition = parseAddition(storageConfig)
+    driver = new CryptV2Driver(addition)
     await driver.init?.()
   } else if (normDriver === "virtual") {
     const addition = parseAddition(storageConfig)
