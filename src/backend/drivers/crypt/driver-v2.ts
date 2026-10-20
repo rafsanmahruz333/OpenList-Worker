@@ -1,0 +1,307 @@
+
+import {
+  StorageDriver,
+  FileItem,
+  calcFileType,
+} from "../../internal/driver/base"
+import { encryptV2, decryptV2 } from "./cipher-v2"
+
+export interface CryptV2Addition {
+  remote_path: string
+  password: string
+  salt: string
+}
+
+const SUFFIX = ".rfv2"
+const CHUNK = 1024 * 1024
+const HEADER = 48
+const TAG = 16
+const MAX_PLAIN = 8 * CHUNK
+const MAX_ENCRYPTED = HEADER + MAX_PLAIN + 8 * TAG
+
+function decodedSize(bytes: number): number {
+  if (
+    !Number.isSafeInteger(bytes) ||
+    bytes < HEADER + TAG ||
+    bytes > MAX_ENCRYPTED
+  ) {
+    return -1
+  }
+
+  for (let blocks = 1; blocks <= 8; blocks++) {
+    const plain = bytes - HEADER - blocks * TAG
+
+    if (
+      plain >= 0 &&
+      plain <= MAX_PLAIN &&
+      Math.max(1, Math.ceil(plain / CHUNK)) === blocks
+    ) {
+      return plain
+    }
+  }
+
+  return -1
+}
+
+export class CryptV2Driver implements StorageDriver {
+  private remoteDriver: StorageDriver | null = null
+  private remoteRoot = "/"
+
+  constructor(private addition: CryptV2Addition) {}
+
+  async init(): Promise<void> {
+    if (
+      !this.addition.password ||
+      this.addition.password.length < 16
+    ) {
+      throw new Error(
+        "[CryptV2] Use a dedicated password of at least 16 characters",
+      )
+    }
+
+    if (
+      !this.addition.salt ||
+      this.addition.salt.length < 16
+    ) {
+      throw new Error(
+        "[CryptV2] Supply a separate salt of at least 16 characters",
+      )
+    }
+
+    const { resolvePath } = await import(
+      "../../internal/model/db"
+    )
+    const { getDriver } = await import(
+      "../../internal/op/storage"
+    )
+
+    const resolved = await resolvePath(
+      this.addition.remote_path || "/",
+    )
+
+    if (resolved.isVirtual || !resolved.storage) {
+      throw new Error(
+        "[CryptV2] Remote path must point to an existing storage",
+      )
+    }
+
+    const underlying = resolved.storage.driver
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, "")
+
+    if (underlying !== "googledrive") {
+      throw new Error(
+        "[CryptV2] Prototype supports GoogleDrive only",
+      )
+    }
+
+    this.remoteRoot = resolved.physical || "/"
+    this.remoteDriver = await getDriver(
+      resolved.storage.driver,
+      resolved.storage,
+    )
+  }
+
+  private remote(path: string): string {
+    const p = path.startsWith("/") ? path : "/" + path
+    const root = this.remoteRoot === "/"
+      ? ""
+      : this.remoteRoot.replace(/\/$/, "")
+
+    return (root + p).replace(/\/{2,}/g, "/")
+  }
+
+  private backend(): StorageDriver {
+    if (!this.remoteDriver) {
+      throw new Error("[CryptV2] Storage not initialized")
+    }
+    return this.remoteDriver
+  }
+
+  async list(
+    _virtualPath: string,
+    physicalPath: string,
+  ): Promise<FileItem[]> {
+    const files = await this.backend().list(
+      "",
+      this.remote(physicalPath),
+    )
+
+    return files.flatMap((item): FileItem[] => {
+      if (item.is_dir) return [item]
+
+      if (!item.name.endsWith(SUFFIX)) return []
+
+      const name = item.name.slice(0, -SUFFIX.length)
+      const size = decodedSize(item.size)
+
+      return [{
+        ...item,
+        name,
+        size: Math.max(0, size),
+        type: calcFileType(name, false),
+        thumb: "",
+        raw_url: "",
+        raw_url_headers: undefined,
+      }]
+    })
+  }
+
+  async get(
+    _virtualPath: string,
+    physicalPath: string,
+  ): Promise<FileItem> {
+    const remotePath = this.remote(physicalPath)
+    const backend = this.backend()
+
+    try {
+      const item = await backend.get(
+        "",
+        remotePath + SUFFIX,
+      )
+
+      if (!item.is_dir && item.raw_url) {
+        const size = decodedSize(item.size)
+
+        if (size < 0) {
+          throw new Error(
+            "[CryptV2] Invalid encrypted file size",
+          )
+        }
+
+        const name = item.name.slice(0, -SUFFIX.length)
+
+        return {
+          ...item,
+          name,
+          size,
+          type: calcFileType(name, false),
+          thumb: "",
+          raw_url: "",
+          raw_url_headers: undefined,
+        }
+      }
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message.includes("Invalid encrypted file size")
+      ) {
+        throw error
+      }
+    }
+
+    const directory = await backend.get("", remotePath)
+
+    if (directory.is_dir) return directory
+
+    throw new Error("[CryptV2] Encrypted file not found")
+  }
+
+  async put(
+    _virtualPath: string,
+    physicalPath: string,
+    content: Buffer,
+  ): Promise<void> {
+    if (content.length > MAX_PLAIN) {
+      throw new Error("[CryptV2] Prototype limit: 8 MiB")
+    }
+
+    const encrypted = await encryptV2(
+      new Uint8Array(content),
+      this.addition.password,
+      this.addition.salt,
+    )
+
+    await this.backend().put(
+      "",
+      this.remote(physicalPath) + SUFFIX,
+      Buffer.from(encrypted),
+    )
+  }
+
+  async createReadStream(
+    physicalPath: string,
+    range?: { start: number; end: number },
+  ): Promise<ReadableStream<Uint8Array>> {
+    const item = await this.backend().get(
+      "",
+      this.remote(physicalPath) + SUFFIX,
+    )
+
+    if (
+      item.is_dir ||
+      !item.raw_url ||
+      decodedSize(item.size) < 0
+    ) {
+      throw new Error(
+        "[CryptV2] File missing or exceeds the 8 MiB limit",
+      )
+    }
+
+    const response = await fetch(item.raw_url, {
+      headers: item.raw_url_headers ?? {},
+    })
+
+    if (!response.ok) {
+      throw new Error(
+        `[CryptV2] Google Drive download failed: ${response.status}`,
+      )
+    }
+
+    const contentLength = Number(
+      response.headers.get("Content-Length"),
+    )
+
+    if (
+      Number.isFinite(contentLength) &&
+      contentLength > MAX_ENCRYPTED
+    ) {
+      throw new Error("[CryptV2] Download exceeds size limit")
+    }
+
+    const encrypted = new Uint8Array(
+      await response.arrayBuffer(),
+    )
+
+    if (encrypted.length > MAX_ENCRYPTED) {
+      throw new Error("[CryptV2] Download exceeds size limit")
+    }
+
+    const plain = await decryptV2(
+      encrypted,
+      this.addition.password,
+      this.addition.salt,
+    )
+
+    const result = range
+      ? plain.slice(range.start, range.end + 1)
+      : plain
+
+    return new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(result)
+        controller.close()
+      },
+    })
+  }
+
+  async mkdir(): Promise<void> {
+    throw new Error("[CryptV2] Creating folders is not yet supported")
+  }
+
+  async rename(): Promise<void> {
+    throw new Error("[CryptV2] Rename is not yet supported")
+  }
+
+  async remove(): Promise<void> {
+    throw new Error("[CryptV2] Delete is not yet supported")
+  }
+
+  async move(): Promise<void> {
+    throw new Error("[CryptV2] Move is not yet supported")
+  }
+
+  async copy(): Promise<void> {
+    throw new Error("[CryptV2] Copy is not yet supported")
+  }
+}
