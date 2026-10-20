@@ -101,15 +101,30 @@ export class CryptDriver implements StorageDriver {
   async get(_virtualPath: string, physicalPath: string): Promise<FileItem> {
     this.ensureReady()
     const remotePhysical = this.joinRemote(physicalPath)
-    const item = await this.remoteDriver!.get("", remotePhysical)
-    if (item.is_dir) return item
+
+    let item: FileItem
+    try {
+      item = await this.remoteDriver!.get(
+        "",
+        remotePhysical + this.suffix,
+      )
+      if (item.is_dir) {
+        throw new Error("[Crypt] Expected an encrypted file")
+      }
+    } catch {
+      const folder = await this.remoteDriver!.get("", remotePhysical)
+      if (folder.is_dir) return folder
+      throw new Error(`[Crypt] File not found: ${physicalPath}`)
+    }
+
     const name = this.decryptName(item.name)
     return {
       ...item,
       name,
       size: this.cipher!.decryptedSize(item.size),
       type: calcFileType(name, false),
-      raw_url: "", // 不返回直链，强制 raw.ts 走 createReadStream 解密下载
+      raw_url: "",
+      raw_url_headers: undefined,
     }
   }
 
@@ -222,7 +237,9 @@ export class CryptDriver implements StorageDriver {
     if (!item.raw_url) {
       throw new Error("[Crypt] 底层驱动未返回下载链接，无法解密下载")
     }
-    const resp = await fetch(item.raw_url)
+    const resp = await fetch(item.raw_url, {
+      headers: item.raw_url_headers ?? {},
+    })
     if (!resp.ok) {
       throw new Error(`[Crypt] 底层下载失败: HTTP ${resp.status}`)
     }
