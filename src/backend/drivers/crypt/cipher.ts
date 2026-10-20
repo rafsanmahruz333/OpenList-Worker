@@ -9,7 +9,7 @@
 //   scrypt(password, salt, N=16384, r=8, p=1, dkLen=64)
 //   dataKey = dk[0:32]（数据加密密钥）
 //   nameKey = dk[32:64]（文件名加密密钥，off 模式下未使用）
-import { scrypt } from "hash-wasm"
+import { scryptSync } from "node:crypto"
 
 const FILE_HEADER_SIZE = 32
 const NONCE_SIZE = 16
