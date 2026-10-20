@@ -21,28 +21,27 @@ export class CryptCipher {
     this.dataKey = dataKey
   }
 
-  static async create(password: string, salt: string): Promise<CryptCipher> {
-    if (!password) {
-      throw new Error("[Crypt] password 不能为空")
-    }
-    const dk = (await scrypt({
-      password,
-      salt: salt || "",
-      costFactor: 16384, // N = 2^14，必须是 2 的幂
-      blockSize: 8, // r
-      parallelism: 1, // p
-      hashLength: 64, // dkLen
-      outputType: "binary",
-    })) as Uint8Array
-    const dataKey = await crypto.subtle.importKey(
-      "raw",
-      dk.slice(0, 32),
-      { name: "AES-CTR" },
-      false,
-      ["encrypt", "decrypt"],
-    )
-    return new CryptCipher(dataKey)
+static async create(password: string, salt: string): Promise<CryptCipher> {
+  if (!password) {
+    throw new Error("[Crypt] password cannot be empty")
   }
+
+  const dk = scryptSync(password, salt || "", 64, {
+    N: 16384,
+    r: 8,
+    p: 1,
+  })
+
+  const dataKey = await crypto.subtle.importKey(
+    "raw",
+    new Uint8Array(dk.subarray(0, 32)),
+    { name: "AES-CTR" },
+    false,
+    ["encrypt", "decrypt"],
+  )
+
+  return new CryptCipher(dataKey)
+}
 
   encryptedSize(plainSize: number): number {
     return plainSize + FILE_HEADER_SIZE
