@@ -200,7 +200,7 @@ async function build() {
   )
 
   // 阿里云 ESA（边缘安全加速）边缘函数入口（仅在源文件存在时构建）
-  if (fs.existsSync("esa-entry.ts")) {
+  if (fs.existsSync("esa-entry.ts") && process.env.BUILD_ESA === "true") {
     await esbuild.build({
       entryPoints: ["esa-entry.ts"],
       bundle: true,
