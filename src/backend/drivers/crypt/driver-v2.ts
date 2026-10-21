@@ -6,6 +6,7 @@ import {
 } from "../../internal/driver/base"
 import { encryptV2, decryptV2 } from "./cipher-v2"
 import { decryptV2RemoteRange } from "./cipher-v2-range"
+import { createV2RemoteStream } from "./cipher-v2-stream"
 
 export interface CryptV2Addition {
   remote_path: string
@@ -17,24 +18,26 @@ const SUFFIX = ".rfv2"
 const CHUNK = 1024 * 1024
 const HEADER = 48
 const TAG = 16
-const MAX_PLAIN = 8 * CHUNK
+const MAX_PLAIN = 8 * CHUNK // upload and legacy full-file decoding limit
+const MAX_READ_PLAIN = 64 * CHUNK // initial read-only streaming test ceiling
+const MAX_READ_ENCRYPTED = HEADER + MAX_READ_PLAIN + 64 * TAG
 const MAX_ENCRYPTED = HEADER + MAX_PLAIN + 8 * TAG
 
 function decodedSize(bytes: number): number {
   if (
     !Number.isSafeInteger(bytes) ||
     bytes < HEADER + TAG ||
-    bytes > MAX_ENCRYPTED
+    bytes > MAX_READ_ENCRYPTED
   ) {
     return -1
   }
 
-  for (let blocks = 1; blocks <= 8; blocks++) {
+  for (let blocks = 1; blocks <= 64; blocks++) {
     const plain = bytes - HEADER - blocks * TAG
 
     if (
       plain >= 0 &&
-      plain <= MAX_PLAIN &&
+      plain <= MAX_READ_PLAIN &&
       Math.max(1, Math.ceil(plain / CHUNK)) === blocks
     ) {
       return plain
@@ -235,14 +238,13 @@ export class CryptV2Driver implements StorageDriver {
       decodedSize(item.size) < 0
     ) {
       throw new Error(
-        "[CryptV2] File missing or exceeds the 8 MiB limit",
+        "[CryptV2] File missing or exceeds the 64 MiB read limit",
       )
     }
 
-    // For short HTTP ranges fetch and authenticate only the necessary chunks.
-    // Keep existing whole-file reads for previews, empty files, and larger
-    // ranges until the future streaming reader is implemented.
-    if (range && range.end - range.start + 1 <= 4 * CHUNK) {
+    // Stream all nonempty files using authenticated Google Drive byte ranges.
+    // Preserve the existing authenticated full-file decoder for empty files.
+    if (decodedSize(item.size) > 0) {
       const downloadUrl = item.raw_url
       const readEncryptedRange = async (start: number, end: number): Promise<Uint8Array> => {
         const headers = new Headers(item.raw_url_headers ?? {})
@@ -274,21 +276,39 @@ export class CryptV2Driver implements StorageDriver {
         return data
       }
 
-      const plainRange = await decryptV2RemoteRange(
+      // Keep the already live-verified short-range behavior unchanged.
+      if (range && range.end - range.start + 1 <= 4 * CHUNK) {
+        const plainRange = await decryptV2RemoteRange(
+          readEncryptedRange,
+          this.addition.password,
+          this.addition.salt,
+          range.start,
+          range.end,
+          item.size,
+        )
+        return new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(plainRange)
+            controller.close()
+          },
+        })
+      }
+
+      // Large requested ranges and full-file downloads are authenticated
+      // sequentially, without buffering the entire encrypted file.
+      const result = await createV2RemoteStream(
         readEncryptedRange,
         this.addition.password,
         this.addition.salt,
-        range.start,
-        range.end,
-        item.size,
-      )
-      return new ReadableStream<Uint8Array>({
-        start(controller) {
-          controller.enqueue(plainRange)
-          controller.close()
+        {
+          ...(range ? { start: range.start, end: range.end } : {}),
+          expectedEncryptedSize: item.size,
+          windowBytes: 2 * CHUNK,
         },
-      })
+      )
+      return result.stream
     }
+
     const response = await fetch(item.raw_url, {
       headers: item.raw_url_headers ?? {},
     })

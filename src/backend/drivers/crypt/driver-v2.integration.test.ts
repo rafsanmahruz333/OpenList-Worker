@@ -193,10 +193,10 @@ test("CryptV2 driver: mocked Google Drive round-trip", async (t) => {
       const damaged = Buffer.from(encrypted)
       damaged[49] ^= 1
       storage.set(physical, damaged)
-      await assert.rejects(
-        () => driver.createReadStream(`/${filename}`),
-        /authentication failed/i,
-      )
+      await assert.rejects(async () => {
+        const stream = await driver.createReadStream(`/${filename}`)
+        await new Response(stream as BodyInit).arrayBuffer()
+      }, /authentication failed/i)
       storage.set(physical, encrypted)
     })
 
