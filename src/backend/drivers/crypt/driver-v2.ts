@@ -108,7 +108,7 @@ export class CryptV2Driver implements StorageDriver {
       ? ""
       : this.remoteRoot.replace(/\/$/, "")
 
-    return (root + p).replace(/\/{2,}/g, "/")
+    return (root + p).replace(/\/{2,}/g, "/").replace(/\/+$/, "") || "/"
   }
 
   private backend(): StorageDriver {
