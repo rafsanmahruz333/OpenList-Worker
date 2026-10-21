@@ -157,7 +157,7 @@ export async function encryptV2(
       await crypto.subtle.encrypt(
         {
           name: "AES-GCM",
-          iv: nonceFor(header, i),
+          iv: nonceFor(header, i) as BufferSource,
           additionalData: header,
           tagLength: 128,
         },
@@ -205,8 +205,8 @@ export async function decryptV2(
         await crypto.subtle.decrypt(
           {
             name: "AES-GCM",
-            iv: nonceFor(header, i),
-            additionalData: header,
+            iv: nonceFor(header, i) as BufferSource,
+            additionalData: header as BufferSource,
             tagLength: 128,
           },
           key,
