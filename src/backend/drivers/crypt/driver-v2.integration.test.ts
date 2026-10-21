@@ -51,12 +51,29 @@ test("CryptV2 driver: mocked Google Drive round-trip", async (t) => {
   // Inject fake storage to avoid connecting to the real database or cloud.
   Object.assign(driver, { remoteDriver: mockGoogleDrive, remoteRoot: root })
 
+  const seenRanges: string[] = []
   const realFetch = globalThis.fetch
   globalThis.fetch = async (_input, init) => {
     const header = new Headers(init?.headers)
     assert.equal(header.get("authorization"), "Bearer fake-test-token")
     const bytes = storage.get(physical)
     if (!bytes) return new Response(null, { status: 404 })
+    const requested = header.get("Range")
+    if (requested) {
+      seenRanges.push(requested)
+      const parsed = /^bytes=(\d+)-(\d+)$/.exec(requested)
+      assert.ok(parsed, "expected an inclusive HTTP byte range")
+      const start = Number(parsed[1])
+      const end = Number(parsed[2])
+      assert.ok(start >= 0 && end >= start && end < bytes.length)
+      return new Response(new Uint8Array(bytes.subarray(start, end + 1)) as BodyInit, {
+        status: 206,
+        headers: {
+          "Content-Range": `bytes ${start}-${end}/${bytes.length}`,
+          "Content-Length": String(end - start + 1),
+        },
+      })
+    }
     return new Response(new Uint8Array(bytes) as BodyInit, {
       status: 200,
       headers: { "Content-Length": String(bytes.length) },
@@ -91,12 +108,84 @@ test("CryptV2 driver: mocked Google Drive round-trip", async (t) => {
     })
 
     await t.test("byte-range download returns the correct segment", async () => {
+      const before = seenRanges.length
       const stream = await driver.createReadStream(`/${filename}`, {
         start: 5,
         end: 15,
       })
       const recovered = Buffer.from(await new Response(stream as BodyInit).arrayBuffer())
       assert.deepEqual(recovered, original.subarray(5, 16))
+      assert.deepEqual(seenRanges.slice(before), ["bytes=0-47", `bytes=48-${48 + original.length + 15}`])
+    })
+
+    await t.test("cross-chunk HTTP ranges authenticate only touched chunks", async () => {
+      const old = storage.get(physical)!
+      const multi = Buffer.alloc(1024 * 1024 + 32, 0x63)
+      for (let i = 0; i < multi.length; i += 43) multi[i] = i % 251
+      try {
+        await driver.put(`/Secure-Test/${filename}`, `/${filename}`, multi)
+        const start = 1024 * 1024 - 5
+        const end = 1024 * 1024 + 9
+        const before = seenRanges.length
+        const stream = await driver.createReadStream(`/${filename}`, { start, end })
+        const received = Buffer.from(await new Response(stream as BodyInit).arrayBuffer())
+        assert.deepEqual(received, multi.subarray(start, end + 1))
+        assert.equal(seenRanges.length - before, 3, "header plus two chunks")
+      } finally {
+        storage.set(physical, old)
+      }
+    })
+
+    await t.test("server ignoring HTTP Range is rejected", async () => {
+      const originalFetch = globalThis.fetch
+      globalThis.fetch = async (_input, init) => {
+        const headers = new Headers(init?.headers)
+        assert.ok(headers.has("Range"), "must request partial file")
+        return new Response(new Uint8Array(storage.get(physical)!) as BodyInit, { status: 200 })
+      }
+      try {
+        await assert.rejects(
+          () => driver.createReadStream(`/${filename}`, { start: 0, end: 5 }),
+          /HTTP 206/,
+        )
+      } finally {
+        globalThis.fetch = originalFetch
+      }
+    })
+
+    await t.test("incorrect Content-Range is rejected", async () => {
+      const originalFetch = globalThis.fetch
+      globalThis.fetch = async (_input, init) => {
+        const headers = new Headers(init?.headers)
+        assert.equal(headers.get("Range"), "bytes=0-47")
+        return new Response(new Uint8Array(storage.get(physical)!.subarray(0, 48)) as BodyInit, {
+          status: 206,
+          headers: { "Content-Range": "bytes 1-48/9999", "Content-Length": "48" },
+        })
+      }
+      try {
+        await assert.rejects(
+          () => driver.createReadStream(`/${filename}`, { start: 0, end: 5 }),
+          /incorrect Content-Range/,
+        )
+      } finally {
+        globalThis.fetch = originalFetch
+      }
+    })
+
+    await t.test("tampered ranged ciphertext fails authentication", async () => {
+      const old = storage.get(physical)!
+      const corrupted = Buffer.from(old)
+      corrupted[60] ^= 1
+      storage.set(physical, corrupted)
+      try {
+        await assert.rejects(
+          () => driver.createReadStream(`/${filename}`, { start: 0, end: 10 }),
+          /authentication failed/i,
+        )
+      } finally {
+        storage.set(physical, old)
+      }
     })
 
     await t.test("modified cloud ciphertext is rejected", async () => {

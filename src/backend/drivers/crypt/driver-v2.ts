@@ -5,6 +5,7 @@ import {
   calcFileType,
 } from "../../internal/driver/base"
 import { encryptV2, decryptV2 } from "./cipher-v2"
+import { decryptV2RemoteRange } from "./cipher-v2-range"
 
 export interface CryptV2Addition {
   remote_path: string
@@ -238,6 +239,56 @@ export class CryptV2Driver implements StorageDriver {
       )
     }
 
+    // For short HTTP ranges fetch and authenticate only the necessary chunks.
+    // Keep existing whole-file reads for previews, empty files, and larger
+    // ranges until the future streaming reader is implemented.
+    if (range && range.end - range.start + 1 <= 4 * CHUNK) {
+      const downloadUrl = item.raw_url
+      const readEncryptedRange = async (start: number, end: number): Promise<Uint8Array> => {
+        const headers = new Headers(item.raw_url_headers ?? {})
+        headers.set("Range", `bytes=${start}-${end}`)
+        headers.set("Accept-Encoding", "identity")
+
+        // Do not forward a Google access token to a redirected host.
+        const partial = await fetch(downloadUrl, { headers, redirect: "manual" })
+        if (partial.status !== 206) {
+          throw new Error(`[CryptV2] Google Drive did not return HTTP 206 (got ${partial.status})`)
+        }
+        const expectedRange = `bytes ${start}-${end}/${item.size}`
+        if (partial.headers.get("Content-Range") !== expectedRange) {
+          throw new Error("[CryptV2] Google Drive returned an incorrect Content-Range")
+        }
+        const encoding = partial.headers.get("Content-Encoding")
+        if (encoding && encoding.toLowerCase() !== "identity") {
+          throw new Error("[CryptV2] Compressed HTTP range response is not supported")
+        }
+        const expectedLength = end - start + 1
+        const lengthHeader = partial.headers.get("Content-Length")
+        if (lengthHeader !== null && Number(lengthHeader) !== expectedLength) {
+          throw new Error("[CryptV2] Incorrect encrypted range Content-Length")
+        }
+        const data = new Uint8Array(await partial.arrayBuffer())
+        if (data.byteLength !== expectedLength) {
+          throw new Error("[CryptV2] Incorrect encrypted range body length")
+        }
+        return data
+      }
+
+      const plainRange = await decryptV2RemoteRange(
+        readEncryptedRange,
+        this.addition.password,
+        this.addition.salt,
+        range.start,
+        range.end,
+        item.size,
+      )
+      return new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(plainRange)
+          controller.close()
+        },
+      })
+    }
     const response = await fetch(item.raw_url, {
       headers: item.raw_url_headers ?? {},
     })
